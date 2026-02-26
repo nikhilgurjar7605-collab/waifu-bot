@@ -1,0 +1,31 @@
+{
+    "exported_at": "2026-02-27T00:19:51.739529",
+    "characters": [
+        {
+            "id": 1,
+            "name": "cuitee",
+            "anime": "Vampire Diary",
+            "rarity": "💫 Rare",
+            "image_url": "AgACAgUAAxkBAAIB-2mgetO1ZPefkLp5vkix-KuVxlvWAAJaDmsbMecIVb-1ja9Fb68aAQADAgADeQADOgQ",
+            "added_by": 1214273889,
+            "created_at": "2026-02-26 16:57:53",
+            "is_custom": 0,
+            "owner_id": null
+        }
+    ],
+    "users": [
+        {
+            "user_id": 1214273889,
+            "username": "itz_nikhil_gurjar",
+            "first_name": "Nikhil",
+            "coins": 100,
+            "catches": 0,
+            "last_daily": "2026-02-26T16:58:17.208938",
+            "banned": 0,
+            "wins": 0,
+            "losses": 0,
+            "milestone_level": 0
+        }
+    ],
+    "stats": {}
+}
