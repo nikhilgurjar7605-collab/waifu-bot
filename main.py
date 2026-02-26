@@ -7,6 +7,9 @@ from config import BOT_TOKEN
 from handlers import user_handlers, admin_handlers, catch_handlers
 from jobs import weekly_leaderboard
 
+# ── 1. IMPORT KEEP ALIVE ──
+from keep_alive import keep_alive
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -14,6 +17,10 @@ logging.basicConfig(
 
 
 def main():
+    # ── 2. START THE WEB SERVER ──
+    # This runs the Flask server in a background thread before the bot starts.
+    keep_alive()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # ── User Commands ──────────────────────────────────────────────
