@@ -1,21 +1,23 @@
 """
-IPL Telegram Bot + Mini Cricket Game (Cricbuzz API + Toss + Clean UI + HTTP Health Check)
-===========================================================================================
-- Live scores, schedule, points table from Cricbuzz (via RapidAPI)
+IPL Telegram Bot + Mini Cricket Game (Self‑Contained Cricbuzz Scraper)
+=======================================================================
+- Live scores, schedule, commentary from Cricbuzz (no external API key)
 - Mini cricket game with coin toss
 - Player profiles, leaderboard, rewards
 - Owner commands for reward settings
 - Auto alerts for subscribed teams
-- HTTP health check server for Render (port 10000)
+- HTTP health check for Render
 """
 
 import asyncio
 import logging
 import random
 import sqlite3
+import sys
 from datetime import datetime, timezone, timedelta
 
-import httpx
+import requests
+from bs4 import BeautifulSoup
 from aiohttp import web
 from telegram import (
     Update,
@@ -34,13 +36,10 @@ from telegram.ext import (
 #  CONFIG
 # ─────────────────────────────────────────────
 BOT_TOKEN    = "8309190047:AAEGzbZsonD9zY3tub8WB1fG-KM40a17FjI"
-CRICBUZZ_HOST = "cricbuzz-cricket.p.rapidapi.com"
-CRICBUZZ_KEY  = "d0ccb6ebe9msh6d053b983ab064fp16450ejsnf1327a64d9f3"
 OWNER_ID     = 1214273889
 
 ALERT_INTERVAL = 300  # 5 minutes
 
-# Default rewards (owner can change)
 DEFAULT_WIN_SKILL_POINTS = 50
 DEFAULT_WIN_YEN          = 100
 
@@ -52,7 +51,6 @@ TEAM_NAMES = {
     "GT": "Gujarat Titans", "LSG": "Lucknow Super Giants",
 }
 
-# Game constants
 MAX_WICKETS = 10
 MAX_OVERS   = 10
 
@@ -75,6 +73,245 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────
+#  CRICBUZZ SCRAPER (self‑contained)
+# ─────────────────────────────────────────────
+class Cricbuzz:
+    url = "http://synd.cricbuzz.com/j2me/1.0/livematches.xml"
+
+    def __init__(self):
+        pass
+
+    def getxml(self, url):
+        try:
+            r = requests.get(url)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Scraper request error: {e}")
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        return soup
+
+    def matchinfo(self, match):
+        return {
+            'id': match['id'],
+            'srs': match['srs'],
+            'mchdesc': match['mchdesc'],
+            'mnum': match['mnum'],
+            'type': match['type'],
+            'mchstate': match.state['mchstate'],
+            'status': match.state['status']
+        }
+
+    def matches(self):
+        xml = self.getxml(self.url)
+        if not xml:
+            return []
+        matches = xml.find_all('match')
+        info = []
+        for match in matches:
+            info.append(self.matchinfo(match))
+        return info
+
+    def livescore(self, mid):
+        xml = self.getxml(self.url)
+        if not xml:
+            return {"error": "Could not fetch data"}
+        match = xml.find(id=str(mid))
+        if match is None:
+            return {"error": "Invalid match id"}
+        if match.state['mchstate'] == 'nextlive':
+            return {"error": "Match not started yet"}
+        curl = match['datapath'] + "commentary.xml"
+        comm = self.getxml(curl)
+        if not comm:
+            return {"error": "No commentary data"}
+        mscr = comm.find('mscr')
+        batting = mscr.find('bttm')
+        bowling = mscr.find('blgtm')
+        batsman = mscr.find_all('btsmn')
+        bowler = mscr.find_all('blrs')
+        data = {'matchinfo': self.matchinfo(match)}
+        d = {'team': batting['sname'], 'score': [], 'batsman': []}
+        for player in batsman:
+            d['batsman'].append({
+                'name': player['sname'],
+                'runs': player['r'],
+                'balls': player['b'],
+                'fours': player['frs'],
+                'six': player['sxs']
+            })
+        for inng in batting.find_all('inngs'):
+            d['score'].append({
+                'desc': inng['desc'],
+                'runs': inng['r'],
+                'wickets': inng['wkts'],
+                'overs': inng['ovrs']
+            })
+        data['batting'] = d
+        d2 = {'team': bowling['sname'], 'score': [], 'bowler': []}
+        for player in bowler:
+            d2['bowler'].append({
+                'name': player['sname'],
+                'overs': player['ovrs'],
+                'maidens': player['mdns'],
+                'runs': player['r'],
+                'wickets': player['wkts']
+            })
+        for inng in bowling.find_all('inngs'):
+            d2['score'].append({
+                'desc': inng['desc'],
+                'runs': inng['r'],
+                'wickets': inng['wkts'],
+                'overs': inng['ovrs']
+            })
+        data['bowling'] = d2
+        return data
+
+    def commentary(self, mid):
+        xml = self.getxml(self.url)
+        if not xml:
+            return {"error": "Could not fetch data"}
+        match = xml.find(id=str(mid))
+        if match is None:
+            return {"error": "Invalid match id"}
+        if match.state['mchstate'] == 'nextlive':
+            return {"error": "Match not started yet"}
+        curl = match['datapath'] + "commentary.xml"
+        comm = self.getxml(curl)
+        if not comm:
+            return {"error": "No commentary"}
+        comments = [c.text for c in comm.find_all('c')]
+        return {'matchinfo': self.matchinfo(match), 'commentary': comments}
+
+    def scorecard(self, mid):
+        xml = self.getxml(self.url)
+        if not xml:
+            return {"error": "Could not fetch data"}
+        match = xml.find(id=str(mid))
+        if match is None:
+            return {"error": "Invalid match id"}
+        if match.state['mchstate'] == 'nextlive':
+            return {"error": "Match not started yet"}
+        surl = match['datapath'] + "scorecard.xml"
+        scard = self.getxml(surl)
+        if not scard:
+            return {"error": "No scorecard"}
+        scrs = scard.find('scrs')
+        innings = scrs.find_all('inngs')
+        data = {'matchinfo': self.matchinfo(match)}
+        squads = scard.find('squads')
+        teams = squads.find_all('team')
+        squad_list = []
+        for team in teams:
+            squad_list.append({
+                'team': team['name'],
+                'members': team['mem'].split(", ")
+            })
+        data['squad'] = squad_list
+        card_list = []
+        for inng in innings:
+            bat = inng.find('bttm')
+            card = {
+                'batteam': bat['sname'],
+                'runs': inng['r'],
+                'wickets': inng['wkts'],
+                'overs': inng['noofovers'],
+                'runrate': bat['rr'],
+                'inngdesc': inng['desc'],
+                'batcard': [],
+                'bowlcard': []
+            }
+            for player in bat.find_all('plyr'):
+                status = player.find('status').text
+                card['batcard'].append({
+                    'name': player['sname'],
+                    'runs': player['r'],
+                    'balls': player['b'],
+                    'fours': player['frs'],
+                    'six': player['six'],
+                    'dismissal': status
+                })
+            bowl = inng.find('bltm')
+            card['bowlteam'] = bowl['sname']
+            for player in bowl.find_all('plyr'):
+                card['bowlcard'].append({
+                    'name': player['sname'],
+                    'overs': player['ovrs'],
+                    'maidens': player['mdns'],
+                    'runs': player['roff'],
+                    'wickets': player['wkts']
+                })
+            card_list.append(card)
+        data['scorecard'] = card_list
+        return data
+
+
+# ─────────────────────────────────────────────
+#  ASYNC WRAPPERS FOR THE SCRAPER
+# ─────────────────────────────────────────────
+async def async_fetch_matches():
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: Cricbuzz().matches())
+
+async def async_fetch_livescore(mid):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: Cricbuzz().livescore(mid))
+
+# Main fetch functions for the bot
+async def fetch_live_matches():
+    """Return live IPL matches with scorecards."""
+    matches = await async_fetch_matches()
+    if not matches:
+        return []
+    live = []
+    for m in matches:
+        if m.get('mchstate') == 'live':
+            score = await async_fetch_livescore(m['id'])
+            if score and 'error' not in score:
+                m['score'] = score
+            live.append(m)
+    return live
+
+async def fetch_upcoming_matches():
+    """Return upcoming matches (schedule)."""
+    matches = await async_fetch_matches()
+    if not matches:
+        return []
+    upcoming = [m for m in matches if m.get('mchstate') == 'nextlive']
+    return upcoming
+
+async def fetch_points_table(series_id):
+    """Points table not available from this scraper; return None for fallback."""
+    return None
+
+def is_ipl(match):
+    """Heuristic to filter IPL matches."""
+    desc = match.get('mchdesc', '')
+    srs = match.get('srs', '')
+    return 'ipl' in desc.lower() or 'ipl' in srs.lower()
+
+def format_score_block(match):
+    """Format a match's live score from scraper data."""
+    name = match.get('mchdesc', 'Match')
+    status = match.get('status', '')
+    score_data = match.get('score', {})
+    if not score_data or 'error' in score_data:
+        return f"🏏 *{name}*\n```\n{status}\n```"
+    batting = score_data.get('batting', {})
+    bowling = score_data.get('bowling', {})
+    batting_score = batting.get('score', [{}])[0] if batting.get('score') else {}
+    bowling_score = bowling.get('score', [{}])[0] if bowling.get('score') else {}
+    lines = [f"🏏 *{name}*", "```"]
+    if batting_score:
+        lines.append(f"{batting.get('team', 'Batting')}: {batting_score.get('runs',0)}/{batting_score.get('wickets',0)} ({batting_score.get('overs',0)} ov)")
+    if bowling_score:
+        lines.append(f"{bowling.get('team', 'Bowling')}: {bowling_score.get('runs',0)}/{bowling_score.get('wickets',0)} ({bowling_score.get('overs',0)} ov)")
+    if status:
+        lines.append(f"\n📌 {status}")
+    lines.append("```")
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
@@ -224,107 +461,7 @@ def db_set_last_score(match_id, score):
 
 
 # ─────────────────────────────────────────────
-#  CRICBUZZ API HELPERS
-# ─────────────────────────────────────────────
-async def cricbuzz_request(endpoint: str):
-    """Make a request to Cricbuzz API and return JSON."""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(
-                f"https://{CRICBUZZ_HOST}{endpoint}",
-                headers={
-                    "x-rapidapi-key": CRICBUZZ_KEY,
-                    "x-rapidapi-host": CRICBUZZ_HOST,
-                }
-            )
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        logger.error(f"Cricbuzz API error: {e}")
-        return None
-
-async def get_ipl_series_id():
-    """Find the series ID for IPL 2026."""
-    data = await cricbuzz_request("/series/list")
-    if not data:
-        return None
-    series_list = data.get("series", data.get("store", []))
-    for series in series_list:
-        name = series.get("name", "").lower()
-        if "ipl" in name and "2026" in name:
-            return series.get("id")
-    return None
-
-async def fetch_live_matches():
-    """Return live IPL matches with scorecards."""
-    series_id = await get_ipl_series_id()
-    if not series_id:
-        return []
-    data = await cricbuzz_request(f"/series/{series_id}/matches")
-    if not data:
-        return []
-    matches = data.get("matches", data.get("store", []))
-    live = []
-    for m in matches:
-        state = m.get("state", "").lower()
-        status = m.get("matchStatus", "").lower()
-        if state == "in progress" or status == "live":
-            match_id = m.get("matchId")
-            if match_id:
-                scorecard = await cricbuzz_request(f"/mcenter/v1/{match_id}/hscard")
-                if scorecard:
-                    m["score"] = scorecard.get("score", [])
-            live.append(m)
-    return live
-
-async def fetch_upcoming_matches():
-    """Return upcoming IPL matches (schedule)."""
-    series_id = await get_ipl_series_id()
-    if not series_id:
-        return []
-    data = await cricbuzz_request(f"/series/{series_id}/matches")
-    if not data:
-        return []
-    matches = data.get("matches", data.get("store", []))
-    upcoming = []
-    for m in matches:
-        state = m.get("state", "").lower()
-        status = m.get("matchStatus", "").lower()
-        if state == "upcoming" or status == "scheduled":
-            upcoming.append(m)
-    return upcoming
-
-async def fetch_points_table(series_id):
-    """Fetch points table for a given series ID."""
-    data = await cricbuzz_request(f"/points_table/series/{series_id}")
-    if not data:
-        return None
-    return data.get("pointsTable", data.get("store", []))
-
-def is_ipl(match):
-    name = match.get("name", "").lower()
-    return "ipl" in name
-
-def format_score_block(match):
-    """Format a match's scorecard nicely."""
-    name = match.get("name", "Match")
-    scores = match.get("score", [])
-    status = match.get("status", match.get("matchStatus", ""))
-    lines = [f"🏏 *{name}*", "```"]
-    for inn in scores:
-        inn_name = inn.get('inning', '').replace('Inning', 'Inn')
-        runs = inn.get('runs', inn.get('r', '-'))
-        wkts = inn.get('wickets', inn.get('w', '-'))
-        overs = inn.get('overs', inn.get('o', '-'))
-        lines.append(f"{inn_name:<10} {runs}/{wkts} ({overs} ov)")
-    if status:
-        lines.append(f"\n📌 {status}")
-    lines.append("```")
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────
-#  IPL COMMAND HANDLERS
+#  IPL COMMAND HANDLERS (using scraper)
 # ─────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -352,85 +489,46 @@ async def cmd_score(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
     await msg.reply_text("⏳ *Fetching live scores from Cricbuzz...*", parse_mode="Markdown")
     matches = await fetch_live_matches()
-    if not matches:
+    ipl_matches = [m for m in matches if is_ipl(m)]
+    if not ipl_matches:
         await msg.reply_text("😴 *No IPL match live right now.*\nUse /today for schedule.", parse_mode="Markdown")
         return
-    blocks = [format_score_block(m) for m in matches]
+    blocks = [format_score_block(m) for m in ipl_matches]
     reply = "🔴 *LIVE IPL SCORES*\n\n" + "\n\n──────────\n\n".join(blocks)
     await msg.reply_text(reply, parse_mode="Markdown")
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
-    await msg.reply_text("⏳ *Fetching schedule from Cricbuzz...*", parse_mode="Markdown")
+    await msg.reply_text("⏳ *Fetching schedule...*", parse_mode="Markdown")
     matches = await fetch_upcoming_matches()
-    if not matches:
+    ipl_matches = [m for m in matches if is_ipl(m)]
+    if not ipl_matches:
         await msg.reply_text("📅 *No IPL matches scheduled today.*", parse_mode="Markdown")
         return
     lines = ["📅 *Today's IPL Matches*\n"]
-    for m in matches:
-        start_time = m.get("startTime", "")
-        try:
-            dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-            ist = dt + timedelta(hours=5, minutes=30)
-            t = ist.strftime("%I:%M %p IST").lstrip("0")
-        except:
-            t = "TBA"
-        venue = m.get("venue", m.get("ground", "TBA"))
-        lines.append(f"🏏 *{m.get('name', 'Match')}*\n🕐 {t} | 🏟 {venue}\n")
+    for m in ipl_matches:
+        lines.append(f"🏏 *{m.get('mchdesc', 'Match')}*\n🕐 Time TBA | 🏟 Venue TBA\n")
     await msg.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
     await msg.reply_text("⏳ *Fetching latest result...*", parse_mode="Markdown")
-    series_id = await get_ipl_series_id()
-    if not series_id:
-        await msg.reply_text("⚠️ Could not fetch series data.", parse_mode="Markdown")
-        return
-    data = await cricbuzz_request(f"/series/{series_id}/matches")
-    if not data:
-        await msg.reply_text("No recent matches found.", parse_mode="Markdown")
-        return
-    matches = data.get("matches", data.get("store", []))
-    ended = [m for m in matches if m.get("state", "").lower() == "complete" or m.get("matchStatus", "").lower() == "ended"]
-    if not ended:
+    matches = await async_fetch_matches()
+    ended = [m for m in matches if m.get('mchstate') == 'result']
+    ipl_ended = [m for m in ended if is_ipl(m)]
+    if not ipl_ended:
         await msg.reply_text("No completed IPL matches recently.", parse_mode="Markdown")
         return
-    latest = ended[0]
-    match_id = latest.get("matchId")
-    if match_id:
-        scorecard = await cricbuzz_request(f"/mcenter/v1/{match_id}/hscard")
-        if scorecard:
-            latest["score"] = scorecard.get("score", [])
+    latest = ipl_ended[0]
+    score = await async_fetch_livescore(latest['id'])
+    if score and 'error' not in score:
+        latest['score'] = score
     await msg.reply_text(f"🏆 *Latest Result*\n\n{format_score_block(latest)}", parse_mode="Markdown")
 
 async def cmd_table(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
-    await msg.reply_text("⏳ *Fetching live points table...*", parse_mode="Markdown")
-    series_id = await get_ipl_series_id()
-    if not series_id:
-        await msg.reply_text("⚠️ Could not find IPL 2026 series ID. Showing static preview.", parse_mode="Markdown")
-        await show_static_table(msg)
-        return
-    table_data = await fetch_points_table(series_id)
-    if not table_data:
-        await msg.reply_text("⚠️ Live points table unavailable. Showing static preview.", parse_mode="Markdown")
-        await show_static_table(msg)
-        return
-    lines = ["📊 *IPL 2026 Points Table*", "```"]
-    lines.append(f"{'#':<3} {'Team':<6} {'P':<3} {'W':<3} {'L':<3} {'NRR':<7} {'Pts'}")
-    lines.append("─" * 38)
-    sorted_teams = sorted(table_data, key=lambda x: (-int(x.get('points',0)), -float(x.get('netRunRate',0))))
-    for i, team in enumerate(sorted_teams[:10], 1):
-        name = team.get('teamName', '???')[:6]
-        p = team.get('matchesPlayed', '0')
-        w = team.get('wins', '0')
-        l = team.get('losses', '0')
-        nrr = team.get('netRunRate', '0.00')
-        pts = team.get('points', '0')
-        lines.append(f"{i:<3} {name:<6} {p:<3} {w:<3} {l:<3} {nrr:<7} {pts}")
-    lines.append("```")
-    lines.append("\n🟢 = Playoff zone (top 4)")
-    await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+    await msg.reply_text("⏳ *Fetching points table...*", parse_mode="Markdown")
+    await show_static_table(msg)
 
 async def show_static_table(msg):
     table = [
@@ -446,7 +544,7 @@ async def show_static_table(msg):
     for i, (team, p, w, l, nrr, pts) in enumerate(table, 1):
         lines.append(f"{i:<3} {team:<6} {p:<3} {w:<3} {l:<3} {nrr:<7} {pts}")
     lines.append("```")
-    lines.append("\n⚠️ *Live data unavailable – showing static preview.*")
+    lines.append("\n⚠️ *Live points table not available – showing static preview.*")
     await msg.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -479,9 +577,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "*🏏 IPL Bot - Help Center*\n\n"
         "*📡 Live Cricket*\n"
-        "• /score - Live IPL scores (Cricbuzz)\n"
+        "• /score - Live IPL scores (self-hosted scraper)\n"
         "• /today - Today's fixtures\n"
-        "• /table - Points table\n"
+        "• /table - Points table (static preview)\n"
         "• /result - Latest match result\n"
         "• /subscribe [TEAM] - Get team alerts\n"
         "• /unsubscribe - Stop alerts\n\n"
@@ -962,18 +1060,15 @@ async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
     if not subscribers:
         return
 
-    matches = await fetch_live_matches()
-    series_id = await get_ipl_series_id()
-    if not series_id:
-        return
-    series_data = await cricbuzz_request(f"/series/{series_id}/matches")
-    all_matches = series_data.get("matches", series_data.get("store", [])) if series_data else []
-    ended = [m for m in all_matches if m.get("state", "").lower() == "complete" or m.get("matchStatus", "").lower() == "ended"]
+    matches = await async_fetch_matches()
+    live_matches = [m for m in matches if m.get('mchstate') == 'live']
+    ended = [m for m in matches if m.get('mchstate') == 'result']
 
     team_match_map = {}
-    for m in matches + ended:
+    for m in live_matches + ended:
+        desc = m.get('mchdesc', '')
         for code, full in TEAM_NAMES.items():
-            if code.lower() in m.get("name", "").lower() or full.lower() in m.get("name", "").lower():
+            if code.lower() in desc.lower() or full.lower() in desc.lower():
                 team_match_map[code] = m
                 break
 
@@ -982,12 +1077,18 @@ async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
         if not match:
             continue
 
-        match_id = str(match.get("matchId", ""))
-        scores = match.get("score", [])
-        score_str = "|".join(f"{s.get('runs',0)}/{s.get('wickets',0)}({s.get('overs',0)})" for s in scores)
+        match_id = str(match['id'])
+        score_data = await async_fetch_livescore(match['id']) if match.get('mchstate') == 'live' else {}
+        if 'error' in score_data:
+            continue
+        batting = score_data.get('batting', {})
+        bowling = score_data.get('bowling', {})
+        batting_score = batting.get('score', [{}])[0] if batting.get('score') else {}
+        bowling_score = bowling.get('score', [{}])[0] if bowling.get('score') else {}
+        score_str = f"{batting.get('team')}:{batting_score.get('runs',0)}/{batting_score.get('wickets',0)}|{bowling.get('team')}:{bowling_score.get('runs',0)}/{bowling_score.get('wickets',0)}"
         last = db_get_last_score(match_id)
 
-        if match.get("state", "").lower() == "complete" and last != "ENDED":
+        if match.get('mchstate') == 'result' and last != "ENDED":
             db_set_last_score(match_id, "ENDED")
             try:
                 await ctx.bot.send_message(
@@ -1012,8 +1113,8 @@ async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"Alert failed {chat_id}: {e}")
             else:
                 try:
-                    prev_w = sum(int(p.split("/")[1].split("(")[0]) for p in last.split("|") if "/" in p)
-                    curr_w = sum(s.get("wickets", 0) for s in scores)
+                    prev_w = sum(int(p.split("/")[1].split("|")[0]) for p in last.split("|") if "/" in p)
+                    curr_w = (batting_score.get('wickets',0) + bowling_score.get('wickets',0))
                     if curr_w > prev_w:
                         await ctx.bot.send_message(
                             chat_id=chat_id,
@@ -1028,11 +1129,9 @@ async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
 #  HTTP HEALTH CHECK SERVER (for Render)
 # ─────────────────────────────────────────────
 async def health_check(request):
-    """Simple health check endpoint for Render."""
     return web.Response(text="OK", status=200)
 
 async def run_http_server():
-    """Run a minimal HTTP server on port 10000."""
     app = web.Application()
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
@@ -1041,7 +1140,6 @@ async def run_http_server():
     site = web.TCPSite(runner, "0.0.0.0", 10000)
     await site.start()
     logger.info("✅ HTTP health check server running on port 10000")
-    # Keep the server running forever
     await asyncio.Event().wait()
 
 
@@ -1051,9 +1149,9 @@ async def run_http_server():
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "🏠 Main menu"),
-        BotCommand("score", "🔴 Live IPL scores (Cricbuzz)"),
+        BotCommand("score", "🔴 Live IPL scores (self-hosted)"),
         BotCommand("today", "📅 Today's matches"),
-        BotCommand("table", "📊 Points table"),
+        BotCommand("table", "📊 Points table (static)"),
         BotCommand("result", "🏆 Latest result"),
         BotCommand("subscribe", "🔔 Subscribe to team alerts"),
         BotCommand("unsubscribe", "🔕 Stop alerts"),
@@ -1071,9 +1169,8 @@ async def post_init(app: Application):
 
 def main():
     db_init()
-    logger.info("🏏 IPL Bot with Cricbuzz API, Mini Cricket, Toss, and Clean UI starting...")
+    logger.info("🏏 IPL Bot with self‑hosted Cricbuzz scraper, Mini Cricket, Toss, and Clean UI starting...")
 
-    # Build the Telegram bot application
     app = (Application.builder()
            .token(BOT_TOKEN)
            .post_init(post_init)
@@ -1102,16 +1199,16 @@ def main():
     # Start the job queue
     app.job_queue.run_repeating(alert_job, interval=ALERT_INTERVAL, first=10)
 
-    # Run both the bot polling and the HTTP server concurrently
+    # Run bot and HTTP server concurrently
     async def run_bot_and_http():
         # Start HTTP server in background
         http_task = asyncio.create_task(run_http_server())
-        # Start the bot polling
+        # Start the bot polling (this is a coroutine)
         await app.initialize()
         await app.start()
-        await app.updater.start_polling()
-        # Keep both running
-        await asyncio.gather(app.updater.running, http_task)
+        polling_task = asyncio.create_task(app.updater.start_polling())
+        # Wait for both tasks to run forever
+        await asyncio.gather(polling_task, http_task)
 
     try:
         asyncio.run(run_bot_and_http())
