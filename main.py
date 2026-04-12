@@ -1,20 +1,22 @@
 """
-IPL Telegram Bot + Mini Cricket Game (Cricbuzz API + Toss + Clean UI)
-=====================================================================
+IPL Telegram Bot + Mini Cricket Game (Cricbuzz API + Toss + Clean UI + HTTP Health Check)
+===========================================================================================
 - Live scores, schedule, points table from Cricbuzz (via RapidAPI)
 - Mini cricket game with coin toss
 - Player profiles, leaderboard, rewards
 - Owner commands for reward settings
 - Auto alerts for subscribed teams
+- HTTP health check server for Render (port 10000)
 """
 
 import asyncio
 import logging
 import random
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
+from aiohttp import web
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -52,9 +54,9 @@ TEAM_NAMES = {
 
 # Game constants
 MAX_WICKETS = 10
-MAX_OVERS   = 5
+MAX_OVERS   = 10
 
-# Commentary (unchanged)
+# Commentary
 SHOT_COMMENTARY = {
     1: ["🟢 Pushed to mid-on for a single.", "🟢 Nudged off the pads — 1 run.", "🟢 Dabbed to third man, easy single."],
     2: ["🟡 Driven through covers — 2 runs!", "🟡 Clipped off the legs, good running — 2!", "🟡 Guided past point — 2 runs."],
@@ -76,7 +78,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-#  DATABASE (unchanged)
+#  DATABASE
 # ─────────────────────────────────────────────
 DB_FILE = "ipl_bot.db"
 
@@ -222,7 +224,7 @@ def db_set_last_score(match_id, score):
 
 
 # ─────────────────────────────────────────────
-#  CRICBUZZ API HELPERS (new)
+#  CRICBUZZ API HELPERS
 # ─────────────────────────────────────────────
 async def cricbuzz_request(endpoint: str):
     """Make a request to Cricbuzz API and return JSON."""
@@ -246,7 +248,6 @@ async def get_ipl_series_id():
     data = await cricbuzz_request("/series/list")
     if not data:
         return None
-    # Cricbuzz returns a list under "series" or "store"
     series_list = data.get("series", data.get("store", []))
     for series in series_list:
         name = series.get("name", "").lower()
@@ -265,7 +266,6 @@ async def fetch_live_matches():
     matches = data.get("matches", data.get("store", []))
     live = []
     for m in matches:
-        # Check if match is live
         state = m.get("state", "").lower()
         status = m.get("matchStatus", "").lower()
         if state == "in progress" or status == "live":
@@ -299,12 +299,9 @@ async def fetch_points_table(series_id):
     data = await cricbuzz_request(f"/points_table/series/{series_id}")
     if not data:
         return None
-    # Points table can be under "pointsTable" or "store"
     return data.get("pointsTable", data.get("store", []))
 
-# Helper to check if a match is IPL (for alerts)
 def is_ipl(match):
-    # We already filtered by series, but keep for safety
     name = match.get("name", "").lower()
     return "ipl" in name
 
@@ -327,7 +324,7 @@ def format_score_block(match):
 
 
 # ─────────────────────────────────────────────
-#  IPL COMMAND HANDLERS (using new API)
+#  IPL COMMAND HANDLERS
 # ─────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -371,12 +368,10 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["📅 *Today's IPL Matches*\n"]
     for m in matches:
-        # Parse date/time (Cricbuzz provides startTime in UTC)
         start_time = m.get("startTime", "")
         try:
             dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-            # Convert to IST
-            ist = dt + datetime.timedelta(hours=5, minutes=30)
+            ist = dt + timedelta(hours=5, minutes=30)
             t = ist.strftime("%I:%M %p IST").lstrip("0")
         except:
             t = "TBA"
@@ -387,7 +382,6 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
     await msg.reply_text("⏳ *Fetching latest result...*", parse_mode="Markdown")
-    # Reuse live matches to find ended ones
     series_id = await get_ipl_series_id()
     if not series_id:
         await msg.reply_text("⚠️ Could not fetch series data.", parse_mode="Markdown")
@@ -401,7 +395,7 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ended:
         await msg.reply_text("No completed IPL matches recently.", parse_mode="Markdown")
         return
-    latest = ended[0]  # assume first is most recent
+    latest = ended[0]
     match_id = latest.get("matchId")
     if match_id:
         scorecard = await cricbuzz_request(f"/mcenter/v1/{match_id}/hscard")
@@ -425,7 +419,6 @@ async def cmd_table(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["📊 *IPL 2026 Points Table*", "```"]
     lines.append(f"{'#':<3} {'Team':<6} {'P':<3} {'W':<3} {'L':<3} {'NRR':<7} {'Pts'}")
     lines.append("─" * 38)
-    # Sort by points desc, then NRR desc
     sorted_teams = sorted(table_data, key=lambda x: (-int(x.get('points',0)), -float(x.get('netRunRate',0))))
     for i, team in enumerate(sorted_teams[:10], 1):
         name = team.get('teamName', '???')[:6]
@@ -440,7 +433,6 @@ async def cmd_table(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def show_static_table(msg):
-    """Fallback static table (original hardcoded data)."""
     table = [
         ("CSK",6,5,1,"+0.82",10),("MI",6,4,2,"+0.44",8),
         ("GT",6,4,2,"+0.31",8),("RCB",6,3,3,"-0.12",6),
@@ -527,7 +519,6 @@ def number_keyboard():
     ])
 
 async def cmd_play(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Start a new mini cricket game with a coin toss."""
     chat_id = update.effective_chat.id
     user = update.effective_user
     db_ensure_player(chat_id, user.username or user.first_name)
@@ -964,16 +955,14 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-#  AUTO-ALERT JOB (updated for Cricbuzz)
+#  AUTO-ALERT JOB
 # ─────────────────────────────────────────────
 async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
     subscribers = db_get_all_subscribers()
     if not subscribers:
         return
 
-    # Get live matches once
     matches = await fetch_live_matches()
-    # Also check for ended matches if needed
     series_id = await get_ipl_series_id()
     if not series_id:
         return
@@ -983,7 +972,6 @@ async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
 
     team_match_map = {}
     for m in matches + ended:
-        # Simple team detection (based on name)
         for code, full in TEAM_NAMES.items():
             if code.lower() in m.get("name", "").lower() or full.lower() in m.get("name", "").lower():
                 team_match_map[code] = m
@@ -1023,7 +1011,6 @@ async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.warning(f"Alert failed {chat_id}: {e}")
             else:
-                # Check for wicket alert (simple: compare total wickets)
                 try:
                     prev_w = sum(int(p.split("/")[1].split("(")[0]) for p in last.split("|") if "/" in p)
                     curr_w = sum(s.get("wickets", 0) for s in scores)
@@ -1035,6 +1022,27 @@ async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
                         )
                 except Exception as e:
                     logger.warning(f"Wicket alert failed {chat_id}: {e}")
+
+
+# ─────────────────────────────────────────────
+#  HTTP HEALTH CHECK SERVER (for Render)
+# ─────────────────────────────────────────────
+async def health_check(request):
+    """Simple health check endpoint for Render."""
+    return web.Response(text="OK", status=200)
+
+async def run_http_server():
+    """Run a minimal HTTP server on port 10000."""
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    await site.start()
+    logger.info("✅ HTTP health check server running on port 10000")
+    # Keep the server running forever
+    await asyncio.Event().wait()
 
 
 # ─────────────────────────────────────────────
@@ -1064,12 +1072,14 @@ async def post_init(app: Application):
 def main():
     db_init()
     logger.info("🏏 IPL Bot with Cricbuzz API, Mini Cricket, Toss, and Clean UI starting...")
+
+    # Build the Telegram bot application
     app = (Application.builder()
            .token(BOT_TOKEN)
            .post_init(post_init)
            .build())
 
-    # IPL commands
+    # Add all handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("score", cmd_score))
     app.add_handler(CommandHandler("today", cmd_today))
@@ -1078,8 +1088,6 @@ def main():
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     app.add_handler(CommandHandler("help", cmd_help))
-
-    # Game commands
     app.add_handler(CommandHandler("play", cmd_play))
     app.add_handler(CommandHandler("bat", cmd_bat))
     app.add_handler(CommandHandler("bowl", cmd_bowl))
@@ -1087,19 +1095,28 @@ def main():
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
     app.add_handler(CommandHandler("rewards", cmd_rewards))
-
-    # Owner commands
     app.add_handler(CommandHandler("setreward", cmd_setreward))
     app.add_handler(CommandHandler("setyen", cmd_setyen))
-
-    # Callback handler
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Auto-alert job
+    # Start the job queue
     app.job_queue.run_repeating(alert_job, interval=ALERT_INTERVAL, first=10)
 
-    logger.info("✅ Bot is running! Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Run both the bot polling and the HTTP server concurrently
+    async def run_bot_and_http():
+        # Start HTTP server in background
+        http_task = asyncio.create_task(run_http_server())
+        # Start the bot polling
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        # Keep both running
+        await asyncio.gather(app.updater.running, http_task)
+
+    try:
+        asyncio.run(run_bot_and_http())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
 
 if __name__ == "__main__":
     main()
