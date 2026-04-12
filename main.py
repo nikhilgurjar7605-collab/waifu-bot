@@ -1,8 +1,11 @@
 """
-IPL Telegram Bot + Mini Cricket Game (Clean UI)
-=================================================
-Enhanced user interface with better formatting, clearer messages,
-and improved game flow.
+IPL Telegram Bot + Mini Cricket Game (Cricbuzz API + Toss + Clean UI)
+=====================================================================
+- Live scores, schedule, points table from Cricbuzz (via RapidAPI)
+- Mini cricket game with coin toss
+- Player profiles, leaderboard, rewards
+- Owner commands for reward settings
+- Auto alerts for subscribed teams
 """
 
 import asyncio
@@ -29,12 +32,13 @@ from telegram.ext import (
 #  CONFIG
 # ─────────────────────────────────────────────
 BOT_TOKEN    = "8309190047:AAEGzbZsonD9zY3tub8WB1fG-KM40a17FjI"
-CRICAPI_KEY  = "bfb4ef11-21a2-45ff-bb66-e0212dba00b6"
+CRICBUZZ_HOST = "cricbuzz-cricket.p.rapidapi.com"
+CRICBUZZ_KEY  = "d0ccb6ebe9msh6d053b983ab064fp16450ejsnf1327a64d9f3"
 OWNER_ID     = 1214273889
 
-CRICAPI_BASE   = "https://api.cricapi.com/v1"
-ALERT_INTERVAL = 300
+ALERT_INTERVAL = 300  # 5 minutes
 
+# Default rewards (owner can change)
 DEFAULT_WIN_SKILL_POINTS = 50
 DEFAULT_WIN_YEN          = 100
 
@@ -46,7 +50,11 @@ TEAM_NAMES = {
     "GT": "Gujarat Titans", "LSG": "Lucknow Super Giants",
 }
 
-# Enhanced commentary
+# Game constants
+MAX_WICKETS = 10
+MAX_OVERS   = 5
+
+# Commentary (unchanged)
 SHOT_COMMENTARY = {
     1: ["🟢 Pushed to mid-on for a single.", "🟢 Nudged off the pads — 1 run.", "🟢 Dabbed to third man, easy single."],
     2: ["🟡 Driven through covers — 2 runs!", "🟡 Clipped off the legs, good running — 2!", "🟡 Guided past point — 2 runs."],
@@ -68,7 +76,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-#  DATABASE (same as before)
+#  DATABASE (unchanged)
 # ─────────────────────────────────────────────
 DB_FILE = "ipl_bot.db"
 
@@ -214,45 +222,103 @@ def db_set_last_score(match_id, score):
 
 
 # ─────────────────────────────────────────────
-#  CRICKET API HELPERS
+#  CRICBUZZ API HELPERS (new)
 # ─────────────────────────────────────────────
-async def fetch_live_matches():
+async def cricbuzz_request(endpoint: str):
+    """Make a request to Cricbuzz API and return JSON."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{CRICAPI_BASE}/currentMatches",
-                                 params={"apikey": CRICAPI_KEY, "offset": 0})
-        data = r.json()
-        return data.get("data", []) if data.get("status") == "success" else []
+            response = await client.get(
+                f"https://{CRICBUZZ_HOST}{endpoint}",
+                headers={
+                    "x-rapidapi-key": CRICBUZZ_KEY,
+                    "x-rapidapi-host": CRICBUZZ_HOST,
+                }
+            )
+        response.raise_for_status()
+        return response.json()
     except Exception as e:
-        logger.error(f"API error: {e}"); return []
+        logger.error(f"Cricbuzz API error: {e}")
+        return None
+
+async def get_ipl_series_id():
+    """Find the series ID for IPL 2026."""
+    data = await cricbuzz_request("/series/list")
+    if not data:
+        return None
+    # Cricbuzz returns a list under "series" or "store"
+    series_list = data.get("series", data.get("store", []))
+    for series in series_list:
+        name = series.get("name", "").lower()
+        if "ipl" in name and "2026" in name:
+            return series.get("id")
+    return None
+
+async def fetch_live_matches():
+    """Return live IPL matches with scorecards."""
+    series_id = await get_ipl_series_id()
+    if not series_id:
+        return []
+    data = await cricbuzz_request(f"/series/{series_id}/matches")
+    if not data:
+        return []
+    matches = data.get("matches", data.get("store", []))
+    live = []
+    for m in matches:
+        # Check if match is live
+        state = m.get("state", "").lower()
+        status = m.get("matchStatus", "").lower()
+        if state == "in progress" or status == "live":
+            match_id = m.get("matchId")
+            if match_id:
+                scorecard = await cricbuzz_request(f"/mcenter/v1/{match_id}/hscard")
+                if scorecard:
+                    m["score"] = scorecard.get("score", [])
+            live.append(m)
+    return live
 
 async def fetch_upcoming_matches():
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{CRICAPI_BASE}/matches",
-                                 params={"apikey": CRICAPI_KEY, "offset": 0})
-        data = r.json()
-        return data.get("data", []) if data.get("status") == "success" else []
-    except Exception as e:
-        logger.error(f"API error: {e}"); return []
+    """Return upcoming IPL matches (schedule)."""
+    series_id = await get_ipl_series_id()
+    if not series_id:
+        return []
+    data = await cricbuzz_request(f"/series/{series_id}/matches")
+    if not data:
+        return []
+    matches = data.get("matches", data.get("store", []))
+    upcoming = []
+    for m in matches:
+        state = m.get("state", "").lower()
+        status = m.get("matchStatus", "").lower()
+        if state == "upcoming" or status == "scheduled":
+            upcoming.append(m)
+    return upcoming
 
+async def fetch_points_table(series_id):
+    """Fetch points table for a given series ID."""
+    data = await cricbuzz_request(f"/points_table/series/{series_id}")
+    if not data:
+        return None
+    # Points table can be under "pointsTable" or "store"
+    return data.get("pointsTable", data.get("store", []))
+
+# Helper to check if a match is IPL (for alerts)
 def is_ipl(match):
-    series = match.get("series_id", "") or match.get("series", "") or ""
-    name   = match.get("name", "")
-    return "ipl" in series.lower() or "indian premier league" in name.lower()
+    # We already filtered by series, but keep for safety
+    name = match.get("name", "").lower()
+    return "ipl" in name
 
 def format_score_block(match):
-    """Clean, monospaced score display"""
+    """Format a match's scorecard nicely."""
     name = match.get("name", "Match")
     scores = match.get("score", [])
-    status = match.get("status", "")
-    
+    status = match.get("status", match.get("matchStatus", ""))
     lines = [f"🏏 *{name}*", "```"]
     for inn in scores:
         inn_name = inn.get('inning', '').replace('Inning', 'Inn')
-        runs = inn.get('r', '-')
-        wkts = inn.get('w', '-')
-        overs = inn.get('o', '-')
+        runs = inn.get('runs', inn.get('r', '-'))
+        wkts = inn.get('wickets', inn.get('w', '-'))
+        overs = inn.get('overs', inn.get('o', '-'))
         lines.append(f"{inn_name:<10} {runs}/{wkts} ({overs} ov)")
     if status:
         lines.append(f"\n📌 {status}")
@@ -261,13 +327,11 @@ def format_score_block(match):
 
 
 # ─────────────────────────────────────────────
-#  IPL COMMAND HANDLERS (Clean UI)
+#  IPL COMMAND HANDLERS (using new API)
 # ─────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db_ensure_player(update.effective_chat.id, user.username or user.first_name)
-    
-    # Clean, categorized menu
     keyboard = [
         [InlineKeyboardButton("🔴 Live Scores", callback_data="score"),
          InlineKeyboardButton("📅 Today's Matches", callback_data="today")],
@@ -278,7 +342,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👤 My Profile", callback_data="profile"),
          InlineKeyboardButton("🔔 Subscribe", callback_data="subscribe_menu")],
     ]
-    
     welcome = (
         f"*🏏 Welcome to IPL 2026 Bot, {user.first_name}!*\n\n"
         "📡 *Live scores* | 📅 *Schedule* | 📊 *Points Table*\n"
@@ -286,68 +349,98 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "▸ Type /help to see all commands\n"
         "▸ Use the buttons below to get started 👇"
     )
-    await update.message.reply_text(
-        welcome,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await update.message.reply_text(welcome, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_score(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
-    await msg.reply_text("⏳ *Fetching live scores...*", parse_mode="Markdown")
+    await msg.reply_text("⏳ *Fetching live scores from Cricbuzz...*", parse_mode="Markdown")
     matches = await fetch_live_matches()
-    ipl_live = [m for m in matches if is_ipl(m) and not m.get("matchEnded")]
-    
-    if not ipl_live:
-        ended = [m for m in matches if is_ipl(m) and m.get("matchEnded")]
-        if ended:
-            reply = f"✅ *Recently Ended Match*\n\n{format_score_block(ended[0])}"
-        else:
-            reply = "😴 *No IPL match live right now.*\nUse /today for schedule."
-    else:
-        blocks = [format_score_block(m) for m in ipl_live]
-        reply = "🔴 *LIVE IPL SCORES*\n\n" + "\n\n──────────\n\n".join(blocks)
+    if not matches:
+        await msg.reply_text("😴 *No IPL match live right now.*\nUse /today for schedule.", parse_mode="Markdown")
+        return
+    blocks = [format_score_block(m) for m in matches]
+    reply = "🔴 *LIVE IPL SCORES*\n\n" + "\n\n──────────\n\n".join(blocks)
     await msg.reply_text(reply, parse_mode="Markdown")
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
-    await msg.reply_text("⏳ *Fetching schedule...*", parse_mode="Markdown")
-    all_m = await fetch_upcoming_matches()
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    today = [m for m in all_m if is_ipl(m) and m.get("dateTimeGMT","").startswith(today_str)]
-    
-    if not today:
-        await msg.reply_text("📅 *No IPL matches today.*\nUse /result for latest result.", parse_mode="Markdown")
+    await msg.reply_text("⏳ *Fetching schedule from Cricbuzz...*", parse_mode="Markdown")
+    matches = await fetch_upcoming_matches()
+    if not matches:
+        await msg.reply_text("📅 *No IPL matches scheduled today.*", parse_mode="Markdown")
         return
-    
     lines = ["📅 *Today's IPL Matches*\n"]
-    for m in today:
-        gmt = m.get("dateTimeGMT","")
+    for m in matches:
+        # Parse date/time (Cricbuzz provides startTime in UTC)
+        start_time = m.get("startTime", "")
         try:
-            dt = datetime.fromisoformat(gmt.replace("Z","+00:00"))
-            h, mn = (dt.hour+5)%24, dt.minute+30
-            if mn>=60: h, mn = (h+1)%24, mn-60
-            t = f"{h:02d}:{mn:02d} IST"
+            dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+            # Convert to IST
+            ist = dt + datetime.timedelta(hours=5, minutes=30)
+            t = ist.strftime("%I:%M %p IST").lstrip("0")
         except:
             t = "TBA"
-        lines.append(f"🏏 *{m.get('name','')}*\n🕐 {t} | 🏟 {m.get('venue','TBA')}\n")
+        venue = m.get("venue", m.get("ground", "TBA"))
+        lines.append(f"🏏 *{m.get('name', 'Match')}*\n🕐 {t} | 🏟 {venue}\n")
     await msg.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
     await msg.reply_text("⏳ *Fetching latest result...*", parse_mode="Markdown")
-    matches = await fetch_live_matches()
-    ended = [m for m in matches if is_ipl(m) and m.get("matchEnded")]
-    if not ended:
-        all_m = await fetch_upcoming_matches()
-        ended = [m for m in all_m if is_ipl(m) and m.get("matchEnded")]
-    if not ended:
-        await msg.reply_text("📭 *No recent IPL result.* Check back after a match!", parse_mode="Markdown")
+    # Reuse live matches to find ended ones
+    series_id = await get_ipl_series_id()
+    if not series_id:
+        await msg.reply_text("⚠️ Could not fetch series data.", parse_mode="Markdown")
         return
-    await msg.reply_text(f"🏆 *Latest Result*\n\n{format_score_block(ended[0])}", parse_mode="Markdown")
+    data = await cricbuzz_request(f"/series/{series_id}/matches")
+    if not data:
+        await msg.reply_text("No recent matches found.", parse_mode="Markdown")
+        return
+    matches = data.get("matches", data.get("store", []))
+    ended = [m for m in matches if m.get("state", "").lower() == "complete" or m.get("matchStatus", "").lower() == "ended"]
+    if not ended:
+        await msg.reply_text("No completed IPL matches recently.", parse_mode="Markdown")
+        return
+    latest = ended[0]  # assume first is most recent
+    match_id = latest.get("matchId")
+    if match_id:
+        scorecard = await cricbuzz_request(f"/mcenter/v1/{match_id}/hscard")
+        if scorecard:
+            latest["score"] = scorecard.get("score", [])
+    await msg.reply_text(f"🏆 *Latest Result*\n\n{format_score_block(latest)}", parse_mode="Markdown")
 
 async def cmd_table(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
+    await msg.reply_text("⏳ *Fetching live points table...*", parse_mode="Markdown")
+    series_id = await get_ipl_series_id()
+    if not series_id:
+        await msg.reply_text("⚠️ Could not find IPL 2026 series ID. Showing static preview.", parse_mode="Markdown")
+        await show_static_table(msg)
+        return
+    table_data = await fetch_points_table(series_id)
+    if not table_data:
+        await msg.reply_text("⚠️ Live points table unavailable. Showing static preview.", parse_mode="Markdown")
+        await show_static_table(msg)
+        return
+    lines = ["📊 *IPL 2026 Points Table*", "```"]
+    lines.append(f"{'#':<3} {'Team':<6} {'P':<3} {'W':<3} {'L':<3} {'NRR':<7} {'Pts'}")
+    lines.append("─" * 38)
+    # Sort by points desc, then NRR desc
+    sorted_teams = sorted(table_data, key=lambda x: (-int(x.get('points',0)), -float(x.get('netRunRate',0))))
+    for i, team in enumerate(sorted_teams[:10], 1):
+        name = team.get('teamName', '???')[:6]
+        p = team.get('matchesPlayed', '0')
+        w = team.get('wins', '0')
+        l = team.get('losses', '0')
+        nrr = team.get('netRunRate', '0.00')
+        pts = team.get('points', '0')
+        lines.append(f"{i:<3} {name:<6} {p:<3} {w:<3} {l:<3} {nrr:<7} {pts}")
+    lines.append("```")
+    lines.append("\n🟢 = Playoff zone (top 4)")
+    await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def show_static_table(msg):
+    """Fallback static table (original hardcoded data)."""
     table = [
         ("CSK",6,5,1,"+0.82",10),("MI",6,4,2,"+0.44",8),
         ("GT",6,4,2,"+0.31",8),("RCB",6,3,3,"-0.12",6),
@@ -355,23 +448,21 @@ async def cmd_table(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ("DC",6,2,4,"-0.33",4),("RR",6,2,4,"-0.41",4),
         ("SRH",6,1,5,"-0.55",2),("LSG",6,1,5,"-0.62",2),
     ]
-    lines = ["📊 *IPL 2026 Points Table*", "```"]
+    lines = ["📊 *IPL 2026 Points Table (Preview)*", "```"]
     lines.append(f"{'#':<3} {'Team':<6} {'P':<3} {'W':<3} {'L':<3} {'NRR':<7} {'Pts'}")
-    lines.append("─" * 35)
+    lines.append("─" * 38)
     for i, (team, p, w, l, nrr, pts) in enumerate(table, 1):
         lines.append(f"{i:<3} {team:<6} {p:<3} {w:<3} {l:<3} {nrr:<7} {pts}")
     lines.append("```")
-    lines.append("\n🟢 = Playoff zone | 🏆 = Champion")
+    lines.append("\n⚠️ *Live data unavailable – showing static preview.*")
     await msg.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not ctx.args:
-        # Show team selection menu
         buttons = [[InlineKeyboardButton(n, callback_data=f"sub_{c}")] for c, n in TEAM_NAMES.items()]
         await msg.reply_text(
-            "🔔 *Subscribe to Team Alerts*\n\n"
-            "Choose your favorite team to get live score updates:",
+            "🔔 *Subscribe to Team Alerts*\n\nChoose your favorite team to get live score updates:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
@@ -396,16 +487,16 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "*🏏 IPL Bot - Help Center*\n\n"
         "*📡 Live Cricket*\n"
-        "• /score - Live IPL scores\n"
+        "• /score - Live IPL scores (Cricbuzz)\n"
         "• /today - Today's fixtures\n"
         "• /table - Points table\n"
         "• /result - Latest match result\n"
         "• /subscribe [TEAM] - Get team alerts\n"
         "• /unsubscribe - Stop alerts\n\n"
         "*🎮 Mini Cricket Game*\n"
-        "• /play - Start a new match\n"
-        "• /bat - Bat first\n"
-        "• /bowl - Bowl first\n"
+        "• /play - Start a new match (with toss!)\n"
+        "• /bat - Bat first (manual override)\n"
+        "• /bowl - Bowl first (manual override)\n"
         "• /shoot [1-6] - Play your shot/delivery\n"
         "• /profile - Your stats\n"
         "• /leaderboard - Top players\n"
@@ -419,12 +510,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-#  MINI CRICKET GAME (Clean UI)
+#  MINI CRICKET GAME (with Toss)
 # ─────────────────────────────────────────────
-
-MAX_WICKETS = 10
-MAX_OVERS   = 10
-
 def overs_str(balls):
     return f"{balls // 6}.{balls % 6}"
 
@@ -440,28 +527,43 @@ def number_keyboard():
     ])
 
 async def cmd_play(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Start a new mini cricket game with a coin toss."""
     chat_id = update.effective_chat.id
     user = update.effective_user
     db_ensure_player(chat_id, user.username or user.first_name)
     db_delete_game(chat_id)
-    db_set_game(chat_id, role="", phase="choose_role", player_runs=0, bot_runs=0,
-                player_wickets=0, bot_wickets=0, balls_played=0, target=0, state="choose_role")
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏏 Bat First", callback_data="game_bat"),
-         InlineKeyboardButton("🎳 Bowl First", callback_data="game_bowl")]
-    ])
-    await (update.message or update.callback_query.message).reply_text(
-        "*🎮 Mini Cricket - New Match!*\n\n"
-        "📋 *Rules:*\n"
-        "• Pick a number 1–6 each ball\n"
-        "• Bot picks randomly\n"
-        "• Same number = OUT / WICKET\n"
-        "• 10 overs (60 balls) or 10 wickets\n\n"
-        "*Choose your option:*",
-        parse_mode="Markdown",
-        reply_markup=keyboard,
-    )
+
+    toss_result = random.choice(["player", "bot"])
+    if toss_result == "player":
+        db_set_game(chat_id, role="", phase="", player_runs=0, bot_runs=0,
+                    player_wickets=0, bot_wickets=0, balls_played=0, target=0, state="toss_player")
+        toss_message = "*🎲 COIN TOSS*\n\n🪙 *You won the toss!*\n\nChoose to bat or bowl first:"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏏 Bat First", callback_data="toss_bat"),
+             InlineKeyboardButton("🎳 Bowl First", callback_data="toss_bowl")]
+        ])
+        await (update.message or update.callback_query.message).reply_text(
+            toss_message, parse_mode="Markdown", reply_markup=keyboard
+        )
+    else:
+        db_set_game(chat_id, role="", phase="", player_runs=0, bot_runs=0,
+                    player_wickets=0, bot_wickets=0, balls_played=0, target=0, state="toss_bot")
+        toss_message = "*🎲 COIN TOSS*\n\n🤖 *Bot won the toss!*\n\nBot chooses to bat or bowl..."
+        bot_choice = random.choice(["bat", "bowl"])
+        if bot_choice == "bat":
+            db_set_game(chat_id, role="bowl", phase="bowling", state="playing")
+            await (update.message or update.callback_query.message).reply_text(
+                f"{toss_message}\n\n🤖 Bot chooses to *BAT first*!\n\n🎳 You will bowl first. Pick your delivery (1–6):",
+                parse_mode="Markdown",
+                reply_markup=number_keyboard(),
+            )
+        else:
+            db_set_game(chat_id, role="bat", phase="batting", state="playing")
+            await (update.message or update.callback_query.message).reply_text(
+                f"{toss_message}\n\n🤖 Bot chooses to *BOWL first*!\n\n🏏 You will bat first. Pick your shot (1–6):",
+                parse_mode="Markdown",
+                reply_markup=number_keyboard(),
+            )
 
 async def cmd_bat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -471,8 +573,7 @@ async def cmd_bat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     db_set_game(chat_id, role="bat", phase="batting", state="playing")
     await update.message.reply_text(
-        "*🏏 You chose to BAT first!*\n\n"
-        "Your innings begins. Pick your shot:",
+        "*🏏 You chose to BAT first!*\n\nPick your shot:",
         parse_mode="Markdown",
         reply_markup=number_keyboard(),
     )
@@ -485,8 +586,7 @@ async def cmd_bowl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     db_set_game(chat_id, role="bowl", phase="bowling", state="playing")
     await update.message.reply_text(
-        "*🎳 You chose to BOWL first!*\n\n"
-        "Bot bats first. Pick your delivery:",
+        "*🎳 You chose to BOWL first!*\n\nPick your delivery:",
         parse_mode="Markdown",
         reply_markup=number_keyboard(),
     )
@@ -506,21 +606,19 @@ async def process_shot(update: Update, ctx: ContextTypes.DEFAULT_TYPE, player_pi
     chat_id = update.effective_chat.id
     msg = update.message if not via_callback else update.callback_query.message
     game = db_get_game(chat_id)
-    
     if not game or game[9] != "playing":
         await msg.reply_text("❌ No active game. Use /play to start!")
         return
-    
+
     _, role, phase, player_runs, bot_runs, player_wickets, bot_wickets, balls_played, target, state = game
     bot_pick = random.randint(1, 6)
     is_out = (player_pick == bot_pick)
     response_lines = []
-    
+
     if phase == "batting":
         commentary = random.choice(BOWL_COMMENTARY)
         response_lines.append(f"🎳 *Bot bowls:* {bot_pick} — {commentary}")
         response_lines.append(f"🏏 *You play:* {player_pick}\n")
-        
         if is_out:
             player_wickets += 1
             response_lines.append(f"💥 *OUT!* ({player_wickets}/{MAX_WICKETS} wickets)")
@@ -533,25 +631,20 @@ async def process_shot(update: Update, ctx: ContextTypes.DEFAULT_TYPE, player_pi
             player_runs += player_pick
             shot_com = random.choice(SHOT_COMMENTARY.get(player_pick, ["Good shot!"]))
             response_lines.append(f"✅ {shot_com} *+{player_pick} runs*")
-        
         balls_played += 1
         db_set_game(chat_id, player_runs=player_runs, player_wickets=player_wickets, balls_played=balls_played)
-        
         if balls_played >= MAX_OVERS * 6:
             response_lines.append(f"\n⏱ *Innings Over!* Your score: *{player_runs}/{player_wickets}* ({overs_str(balls_played)} ov)")
             await msg.reply_text("\n".join(response_lines), parse_mode="Markdown")
             await start_second_innings(msg, chat_id, player_runs, player_wickets, bot_runs, bot_wickets, balls_played, role)
             return
-        
-        # Scorecard display
         response_lines.append(f"\n📊 *Score:* {player_runs}/{player_wickets} ({overs_str(balls_played)} ov)")
         if balls_played % 6 == 0:
             response_lines.append(f"🔔 *End of Over {balls_played//6}*")
-    
+
     elif phase == "bowling":
         response_lines.append(f"🏏 *Bot plays:* {bot_pick}")
         response_lines.append(f"🎳 *You bowled:* {player_pick}\n")
-        
         if is_out:
             bot_wickets += 1
             response_lines.append(f"💥 *WICKET!* Bot: {bot_wickets}/{MAX_WICKETS}")
@@ -568,22 +661,18 @@ async def process_shot(update: Update, ctx: ContextTypes.DEFAULT_TYPE, player_pi
                 response_lines.append(f"🔴 *FOUR!* Bot scores 4 runs!")
             else:
                 response_lines.append(f"🤖 Bot scores {bot_pick} runs.")
-        
         if target > 0 and bot_runs > target:
             db_set_game(chat_id, bot_runs=bot_runs, bot_wickets=bot_wickets, balls_played=balls_played)
             await msg.reply_text("\n".join(response_lines), parse_mode="Markdown")
             await end_game(msg, chat_id, player_runs, bot_runs, player_wickets, bot_wickets, role)
             return
-        
         balls_played += 1
         db_set_game(chat_id, bot_runs=bot_runs, bot_wickets=bot_wickets, balls_played=balls_played)
-        
         if balls_played >= MAX_OVERS * 6:
             response_lines.append(f"\n⏱ *Bot Innings Over!* Bot: *{bot_runs}/{bot_wickets}* ({overs_str(balls_played)} ov)")
             await msg.reply_text("\n".join(response_lines), parse_mode="Markdown")
             await start_second_innings(msg, chat_id, player_runs, player_wickets, bot_runs, bot_wickets, balls_played, role)
             return
-        
         response_lines.append(f"\n🤖 *Bot:* {bot_runs}/{bot_wickets} ({overs_str(balls_played)} ov)")
         if target > 0:
             need = target - bot_runs + 1
@@ -591,12 +680,11 @@ async def process_shot(update: Update, ctx: ContextTypes.DEFAULT_TYPE, player_pi
             response_lines.append(f"🎯 *Bot needs {need} runs from {left} balls*")
         if balls_played % 6 == 0:
             response_lines.append(f"🔔 *End of Over {balls_played//6}*")
-    
+
     elif phase == "batting2":
         commentary = random.choice(BOWL_COMMENTARY)
         response_lines.append(f"🎳 *Bot bowls:* {bot_pick} — {commentary}")
         response_lines.append(f"🏏 *You play:* {player_pick}\n")
-        
         if is_out:
             player_wickets += 1
             response_lines.append(f"💥 *OUT!* ({player_wickets}/{MAX_WICKETS} wickets)")
@@ -616,24 +704,20 @@ async def process_shot(update: Update, ctx: ContextTypes.DEFAULT_TYPE, player_pi
                 await msg.reply_text("\n".join(response_lines), parse_mode="Markdown")
                 await end_game(msg, chat_id, player_runs, bot_runs, player_wickets, bot_wickets, role)
                 return
-        
         balls_played += 1
         db_set_game(chat_id, player_runs=player_runs, player_wickets=player_wickets, balls_played=balls_played)
-        
         if balls_played >= MAX_OVERS * 6:
             await msg.reply_text("\n".join(response_lines), parse_mode="Markdown")
             await end_game(msg, chat_id, player_runs, bot_runs, player_wickets, bot_wickets, role)
             return
-        
         need = target - player_runs + 1
         left = MAX_OVERS*6 - balls_played
         response_lines.append(f"\n📊 *You:* {player_runs}/{player_wickets} ({overs_str(balls_played)} ov)")
         response_lines.append(f"🎯 *Need {need} runs from {left} balls*")
-    
+
     elif phase == "bowling2":
         response_lines.append(f"🏏 *Bot plays:* {bot_pick}")
         response_lines.append(f"🎳 *You bowled:* {player_pick}\n")
-        
         if is_out:
             bot_wickets += 1
             response_lines.append(f"💥 *WICKET!* Bot: {bot_wickets}/{MAX_WICKETS}")
@@ -656,22 +740,18 @@ async def process_shot(update: Update, ctx: ContextTypes.DEFAULT_TYPE, player_pi
                 await msg.reply_text("\n".join(response_lines), parse_mode="Markdown")
                 await end_game(msg, chat_id, player_runs, bot_runs, player_wickets, bot_wickets, role)
                 return
-        
         balls_played += 1
         db_set_game(chat_id, bot_runs=bot_runs, bot_wickets=bot_wickets, balls_played=balls_played)
-        
         if balls_played >= MAX_OVERS * 6:
             await msg.reply_text("\n".join(response_lines), parse_mode="Markdown")
             await end_game(msg, chat_id, player_runs, bot_runs, player_wickets, bot_wickets, role)
             return
-        
         need = target - bot_runs + 1
         left = MAX_OVERS*6 - balls_played
         response_lines.append(f"\n🤖 *Bot:* {bot_runs}/{bot_wickets} ({overs_str(balls_played)} ov)")
         response_lines.append(f"🎯 *Bot needs {need} runs from {left} balls*")
-    
-    await msg.reply_text("\n".join(response_lines), parse_mode="Markdown", reply_markup=number_keyboard())
 
+    await msg.reply_text("\n".join(response_lines), parse_mode="Markdown", reply_markup=number_keyboard())
 
 async def start_second_innings(msg, chat_id, player_runs, player_wickets, bot_runs, bot_wickets, balls_played, role):
     if role == "bat":
@@ -699,22 +779,21 @@ async def start_second_innings(msg, chat_id, player_runs, player_wickets, bot_ru
             reply_markup=number_keyboard(),
         )
 
-
 async def end_game(msg, chat_id, player_runs, bot_runs, player_wickets, bot_wickets, role):
     db_delete_game(chat_id)
     win_sp = int(db_get_setting("win_skill_points") or DEFAULT_WIN_SKILL_POINTS)
     win_yen = int(db_get_setting("win_yen") or DEFAULT_WIN_YEN)
-    
+
     player_won = player_runs > bot_runs
     margin = abs(player_runs - bot_runs)
-    
+
     scoreboard = (
         f"```\n"
         f"YOU: {player_runs}/{player_wickets}\n"
         f"BOT: {bot_runs}/{bot_wickets}\n"
         f"```"
     )
-    
+
     if player_won:
         db_add_win(chat_id, win_sp, win_yen, player_runs, player_wickets)
         result = (
@@ -734,7 +813,7 @@ async def end_game(msg, chat_id, player_runs, bot_runs, player_wickets, bot_wick
             f"{scoreboard}\n"
             f"Better luck next time! Use /play to try again."
         )
-    
+
     play_again = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Play Again", callback_data="play"),
         InlineKeyboardButton("🏅 Leaderboard", callback_data="leaderboard"),
@@ -742,6 +821,9 @@ async def end_game(msg, chat_id, player_runs, bot_runs, player_wickets, bot_wick
     await msg.reply_text(result, parse_mode="Markdown", reply_markup=play_again)
 
 
+# ─────────────────────────────────────────────
+#  PROFILE & LEADERBOARD
+# ─────────────────────────────────────────────
 async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg = update.message or update.callback_query.message
@@ -750,14 +832,11 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not p:
         await msg.reply_text("❌ Profile not found. Use /play to start playing!")
         return
-    
     _, username, sp, yen, wins, losses, runs, wickets = p
     total = wins + losses
     wr = f"{wins/total*100:.1f}%" if total > 0 else "N/A"
-    
     win_sp = db_get_setting("win_skill_points") or DEFAULT_WIN_SKILL_POINTS
     win_yen = db_get_setting("win_yen") or DEFAULT_WIN_YEN
-    
     profile_text = (
         f"*👤 Player Profile: {username}*\n\n"
         f"⭐ Skill Points: *{sp}*\n"
@@ -773,14 +852,12 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await msg.reply_text(profile_text, parse_mode="Markdown")
 
-
 async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
     rows = db_get_leaderboard()
     if not rows:
         await msg.reply_text("🏆 *No players yet.* Be the first to play!", parse_mode="Markdown")
         return
-    
     medals = ["🥇", "🥈", "🥉"] + ["🏅"] * 7
     lines = ["*🏆 TOP 10 PLAYERS*", "```"]
     lines.append(f"{'#':<3} {'Player':<15} {'SP':<6} {'Yen':<6} {'W/L'}")
@@ -790,7 +867,6 @@ async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{medals[i-1]} {name:<12} {sp:<6} {yen:<6} {wins}/{losses}")
     lines.append("```")
     await msg.reply_text("\n".join(lines), parse_mode="Markdown")
-
 
 async def cmd_rewards(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sp = db_get_setting("win_skill_points") or DEFAULT_WIN_SKILL_POINTS
@@ -806,7 +882,7 @@ async def cmd_rewards(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-#  OWNER-ONLY COMMANDS
+#  OWNER COMMANDS
 # ─────────────────────────────────────────────
 async def cmd_setreward(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -838,7 +914,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    
+
     if data == "score": await cmd_score(update, ctx)
     elif data == "today": await cmd_today(update, ctx)
     elif data == "table": await cmd_table(update, ctx)
@@ -848,24 +924,28 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "profile": await cmd_profile(update, ctx)
     elif data == "subscribe_menu":
         buttons = [[InlineKeyboardButton(n, callback_data=f"sub_{c}")] for c, n in TEAM_NAMES.items()]
-        await query.message.reply_text(
-            "🔔 *Select your team:*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        await query.message.reply_text("🔔 *Select your team:*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
     elif data == "quit_game":
         db_delete_game(update.effective_chat.id)
         await query.message.reply_text("❌ *Game cancelled.* Use /play to start a new match.", parse_mode="Markdown")
-    elif data == "game_bat":
+    elif data == "toss_bat":
         chat_id = update.effective_chat.id
+        game = db_get_game(chat_id)
+        if not game or game[9] != "toss_player":
+            await query.message.reply_text("❌ No active toss. Use /play to start a new game.")
+            return
         db_set_game(chat_id, role="bat", phase="batting", state="playing")
         await query.message.reply_text(
             "*🏏 You chose to BAT first!*\n\nPick your shot:",
             parse_mode="Markdown",
             reply_markup=number_keyboard(),
         )
-    elif data == "game_bowl":
+    elif data == "toss_bowl":
         chat_id = update.effective_chat.id
+        game = db_get_game(chat_id)
+        if not game or game[9] != "toss_player":
+            await query.message.reply_text("❌ No active toss. Use /play to start a new game.")
+            return
         db_set_game(chat_id, role="bowl", phase="bowling", state="playing")
         await query.message.reply_text(
             "*🎳 You chose to BOWL first!*\n\nPick your delivery:",
@@ -880,40 +960,46 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         username = update.effective_user.username or ""
         db_subscribe(chat_id, team, username)
-        await query.message.reply_text(
-            f"✅ *Subscribed to {TEAM_NAMES.get(team, team)} alerts!*",
-            parse_mode="Markdown",
-        )
+        await query.message.reply_text(f"✅ *Subscribed to {TEAM_NAMES.get(team, team)} alerts!*", parse_mode="Markdown")
 
 
 # ─────────────────────────────────────────────
-#  AUTO-ALERT JOB
+#  AUTO-ALERT JOB (updated for Cricbuzz)
 # ─────────────────────────────────────────────
 async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
     subscribers = db_get_all_subscribers()
-    if not subscribers: return
-    
+    if not subscribers:
+        return
+
+    # Get live matches once
     matches = await fetch_live_matches()
-    ipl_live = [m for m in matches if is_ipl(m) and not m.get("matchEnded")]
-    ipl_ended = [m for m in matches if is_ipl(m) and m.get("matchEnded")]
-    
+    # Also check for ended matches if needed
+    series_id = await get_ipl_series_id()
+    if not series_id:
+        return
+    series_data = await cricbuzz_request(f"/series/{series_id}/matches")
+    all_matches = series_data.get("matches", series_data.get("store", [])) if series_data else []
+    ended = [m for m in all_matches if m.get("state", "").lower() == "complete" or m.get("matchStatus", "").lower() == "ended"]
+
     team_match_map = {}
-    for m in ipl_live + ipl_ended:
-        for team in m.get("teams", []):
-            for code, full in TEAM_NAMES.items():
-                if code.lower() in team.lower() or full.lower() in team.lower():
-                    team_match_map[code] = m
-    
+    for m in matches + ended:
+        # Simple team detection (based on name)
+        for code, full in TEAM_NAMES.items():
+            if code.lower() in m.get("name", "").lower() or full.lower() in m.get("name", "").lower():
+                team_match_map[code] = m
+                break
+
     for chat_id, team_code in subscribers:
         match = team_match_map.get(team_code)
-        if not match: continue
-        
-        match_id = match.get("id", "")
+        if not match:
+            continue
+
+        match_id = str(match.get("matchId", ""))
         scores = match.get("score", [])
-        score_str = "|".join(f"{s.get('r')}/{s.get('w')}({s.get('o')})" for s in scores)
+        score_str = "|".join(f"{s.get('runs',0)}/{s.get('wickets',0)}({s.get('overs',0)})" for s in scores)
         last = db_get_last_score(match_id)
-        
-        if match.get("matchEnded") and last != "ENDED":
+
+        if match.get("state", "").lower() == "complete" and last != "ENDED":
             db_set_last_score(match_id, "ENDED")
             try:
                 await ctx.bot.send_message(
@@ -924,7 +1010,7 @@ async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Alert failed {chat_id}: {e}")
             continue
-        
+
         if score_str and score_str != last:
             db_set_last_score(match_id, score_str)
             if last is None:
@@ -937,9 +1023,10 @@ async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.warning(f"Alert failed {chat_id}: {e}")
             else:
+                # Check for wicket alert (simple: compare total wickets)
                 try:
                     prev_w = sum(int(p.split("/")[1].split("(")[0]) for p in last.split("|") if "/" in p)
-                    curr_w = sum(s.get("w", 0) for s in scores)
+                    curr_w = sum(s.get("wickets", 0) for s in scores)
                     if curr_w > prev_w:
                         await ctx.bot.send_message(
                             chat_id=chat_id,
@@ -947,7 +1034,7 @@ async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
                             parse_mode="Markdown"
                         )
                 except Exception as e:
-                    logger.warning(f"Alert failed {chat_id}: {e}")
+                    logger.warning(f"Wicket alert failed {chat_id}: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -956,15 +1043,15 @@ async def alert_job(ctx: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "🏠 Main menu"),
-        BotCommand("score", "🔴 Live IPL scores"),
+        BotCommand("score", "🔴 Live IPL scores (Cricbuzz)"),
         BotCommand("today", "📅 Today's matches"),
         BotCommand("table", "📊 Points table"),
         BotCommand("result", "🏆 Latest result"),
         BotCommand("subscribe", "🔔 Subscribe to team alerts"),
         BotCommand("unsubscribe", "🔕 Stop alerts"),
-        BotCommand("play", "🎮 Start mini cricket"),
-        BotCommand("bat", "🏏 Bat first in game"),
-        BotCommand("bowl", "🎳 Bowl first in game"),
+        BotCommand("play", "🎮 Start mini cricket (with toss)"),
+        BotCommand("bat", "🏏 Bat first (manual)"),
+        BotCommand("bowl", "🎳 Bowl first (manual)"),
         BotCommand("shoot", "🎯 Play a shot (1-6)"),
         BotCommand("profile", "👤 Your stats"),
         BotCommand("leaderboard", "🏅 Top players"),
@@ -976,14 +1063,13 @@ async def post_init(app: Application):
 
 def main():
     db_init()
-    logger.info("🏏 IPL Bot with Mini Cricket Game starting... (Clean UI)")
-    
+    logger.info("🏏 IPL Bot with Cricbuzz API, Mini Cricket, Toss, and Clean UI starting...")
     app = (Application.builder()
            .token(BOT_TOKEN)
            .post_init(post_init)
            .build())
-    
-    # IPL handlers
+
+    # IPL commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("score", cmd_score))
     app.add_handler(CommandHandler("today", cmd_today))
@@ -992,8 +1078,8 @@ def main():
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     app.add_handler(CommandHandler("help", cmd_help))
-    
-    # Game handlers
+
+    # Game commands
     app.add_handler(CommandHandler("play", cmd_play))
     app.add_handler(CommandHandler("bat", cmd_bat))
     app.add_handler(CommandHandler("bowl", cmd_bowl))
@@ -1001,17 +1087,17 @@ def main():
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
     app.add_handler(CommandHandler("rewards", cmd_rewards))
-    
+
     # Owner commands
     app.add_handler(CommandHandler("setreward", cmd_setreward))
     app.add_handler(CommandHandler("setyen", cmd_setyen))
-    
+
     # Callback handler
     app.add_handler(CallbackQueryHandler(button_handler))
-    
+
     # Auto-alert job
     app.job_queue.run_repeating(alert_job, interval=ALERT_INTERVAL, first=10)
-    
+
     logger.info("✅ Bot is running! Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
