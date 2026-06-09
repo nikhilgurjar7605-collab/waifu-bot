@@ -2,3 +2,6 @@ python-telegram-bot[job-queue]
 requests
 beautifulsoup4
 aiohttp
+flask
+gunicorn
+
